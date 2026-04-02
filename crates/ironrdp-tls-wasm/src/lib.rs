@@ -25,6 +25,8 @@ pub struct TlsStream<S> {
     inner: S,
     /// Outgoing TLS ciphertext that hasn't been flushed to the wire yet.
     write_buf: Vec<u8>,
+    /// Incoming ciphertext that hasn't been fed to rustls yet.
+    read_buf: Vec<u8>,
 }
 
 impl<S> TlsStream<S> {
@@ -70,7 +72,7 @@ where
         x509_cert::Certificate::from_der(cert).map_err(io::Error::other)?
     };
 
-    Ok((TlsStream { tls, inner: stream, write_buf: Vec::new() }, tls_cert))
+    Ok((TlsStream { tls, inner: stream, write_buf: Vec::new(), read_buf: Vec::new() }, tls_cert))
 }
 
 /// Drive the rustls handshake to completion over an async stream.
@@ -134,39 +136,48 @@ where
             _ => {}
         }
 
+        // Feed any buffered ciphertext to rustls first
+        if !this.read_buf.is_empty() {
+            let used = this.tls.read_tls(&mut this.read_buf.as_slice())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            this.read_buf.drain(..used);
+
+            this.tls.process_new_packets()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+            if this.tls.wants_write() {
+                let _ = this.tls.write_tls(&mut this.write_buf);
+            }
+
+            match this.tls.reader().read(buf) {
+                Ok(n) if n > 0 => return Poll::Ready(Ok(n)),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
+                _ => {}
+            }
+        }
+
         // Need more ciphertext from the wire.
         let mut tmp = [0u8; 16384];
         match Pin::new(&mut this.inner).poll_read(cx, &mut tmp) {
             Poll::Ready(Ok(0)) => Poll::Ready(Ok(0)),
             Poll::Ready(Ok(n)) => {
-                // Feed bytes to rustls one record at a time, draining plaintext
-                // between records to avoid "message buffer full" errors.
-                let mut consumed = 0;
-                while consumed < n {
-                    match this.tls.read_tls(&mut &tmp[consumed..n]) {
-                        Ok(0) => break,
-                        Ok(used) => consumed += used,
-                        Err(e) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
-                    }
+                // Feed to rustls
+                let used = this.tls.read_tls(&mut &tmp[..n])
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-                    let state = this.tls.process_new_packets()
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-                    // If rustls needs to send data (e.g., alerts), buffer it
-                    if this.tls.wants_write() {
-                        let _ = this.tls.write_tls(&mut this.write_buf);
-                    }
-
-                    // If plaintext is available, drain some to make room
-                    if state.plaintext_bytes_to_read() > 0 {
-                        let n = this.tls.reader().read(buf)?;
-                        if n > 0 {
-                            return Poll::Ready(Ok(n));
-                        }
-                    }
+                // Buffer any unconsumed bytes for next call
+                if used < n {
+                    this.read_buf.extend_from_slice(&tmp[used..n]);
                 }
 
-                // Try to read any remaining plaintext
+                this.tls.process_new_packets()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+                if this.tls.wants_write() {
+                    let _ = this.tls.write_tls(&mut this.write_buf);
+                }
+
                 match this.tls.reader().read(buf) {
                     Ok(n) if n > 0 => Poll::Ready(Ok(n)),
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
