@@ -139,7 +139,8 @@ where
         match Pin::new(&mut this.inner).poll_read(cx, &mut tmp) {
             Poll::Ready(Ok(0)) => Poll::Ready(Ok(0)),
             Poll::Ready(Ok(n)) => {
-                // Feed all bytes to rustls
+                // Feed bytes to rustls one record at a time, draining plaintext
+                // between records to avoid "message buffer full" errors.
                 let mut consumed = 0;
                 while consumed < n {
                     match this.tls.read_tls(&mut &tmp[consumed..n]) {
@@ -147,23 +148,36 @@ where
                         Ok(used) => consumed += used,
                         Err(e) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
                     }
-                }
-                this.tls
-                    .process_new_packets()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-                // If rustls needs to send data (e.g., alerts, renegotiation), buffer it
-                if this.tls.wants_write() {
-                    let _ = this.tls.write_tls(&mut this.write_buf);
+                    let state = this.tls.process_new_packets()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+                    // If rustls needs to send data (e.g., alerts), buffer it
+                    if this.tls.wants_write() {
+                        let _ = this.tls.write_tls(&mut this.write_buf);
+                    }
+
+                    // If plaintext is available, drain some to make room
+                    if state.plaintext_bytes_to_read() > 0 {
+                        let n = this.tls.reader().read(buf)?;
+                        if n > 0 {
+                            return Poll::Ready(Ok(n));
+                        }
+                    }
                 }
 
+                // Try to read any remaining plaintext
                 match this.tls.reader().read(buf) {
-                    Ok(n) => Poll::Ready(Ok(n)),
+                    Ok(n) if n > 0 => Poll::Ready(Ok(n)),
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         cx.waker().wake_by_ref();
                         Poll::Pending
                     }
                     Err(e) => Poll::Ready(Err(e)),
+                    _ => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
                 }
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
