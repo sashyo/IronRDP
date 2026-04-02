@@ -1078,6 +1078,7 @@ async fn connect_direct(
     }
 
     // Wait for proxy to confirm TCP connection
+    let mut tls_server_name = "localhost".to_owned();
     {
         use futures_util::StreamExt as _;
         use gloo_net::websocket::Message as WsMsg;
@@ -1088,6 +1089,14 @@ async fn connect_direct(
                     return Err(IronError::from(anyhow::anyhow!("Proxy routing failed: {text}")));
                 }
                 info!("Proxy TCP connection established: {text}");
+                // Extract the actual RDP server host for TLS SNI
+                // Simple parse: look for "host":"<value>" in the JSON response
+                if let Some(start) = text.find("\"host\":\"") {
+                    let rest = &text[start + 8..];
+                    if let Some(end) = rest.find('"') {
+                        tls_server_name = rest[..end].to_owned();
+                    }
+                }
             }
             other => {
                 return Err(IronError::from(anyhow::anyhow!(
@@ -1113,10 +1122,9 @@ async fn connect_direct(
 
     // Step 2: TLS upgrade — the handshake goes end-to-end through the tunnel
     let (ws, leftover) = framed.into_inner();
-    // Use "localhost" as the TLS server name — cert verification is disabled anyway
-    // (RDP servers use self-signed certs). The destination name (e.g. "Sasha'sPc")
-    // is not a valid DNS name and would be rejected by rustls.
-    let (tls_stream, tls_cert) = ironrdp_tls_wasm::upgrade(ws, "localhost")
+    // Use the actual RDP server host from the routing response for TLS SNI.
+    // Cert verification is disabled (NoCertificateVerification) since RDP servers use self-signed certs.
+    let (tls_stream, tls_cert) = ironrdp_tls_wasm::upgrade(ws, &tls_server_name)
         .await
         .map_err(|e| IronError::from(anyhow::anyhow!("TLS upgrade failed: {e}")))?;
 
