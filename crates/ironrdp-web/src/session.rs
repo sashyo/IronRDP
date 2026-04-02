@@ -1100,7 +1100,16 @@ async fn connect_direct(
     let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
 
     // Step 1: X.224 negotiation (travels through the blind proxy to the RDP server)
-    let should_upgrade = ironrdp_futures::connect_begin(&mut framed, &mut connector).await?;
+    // Note: can't use connect_begin() because it requires Sync, which gloo WebSocket doesn't impl.
+    // Manually step through the connector until it's ready for TLS upgrade.
+    {
+        use ironrdp::connector::Sequence as _;
+        let mut buf = WriteBuf::new();
+        while !connector.should_perform_security_upgrade() {
+            ironrdp_futures::single_sequence_step(&mut framed, &mut connector, &mut buf).await?;
+        }
+    }
+    let should_upgrade = ironrdp_futures::skip_connect_begin(&mut connector);
 
     // Step 2: TLS upgrade — the handshake goes end-to-end through the tunnel
     let (ws, leftover) = framed.into_inner();
