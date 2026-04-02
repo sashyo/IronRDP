@@ -9,6 +9,9 @@ use anyhow::Context as _;
 use base64::Engine as _;
 use futures_channel::mpsc;
 use futures_util::io::{ReadHalf, WriteHalf};
+
+type BoxedReader = Box<dyn futures_io::AsyncRead + Unpin>;
+type BoxedWriter = Box<dyn futures_io::AsyncWrite + Unpin>;
 use futures_util::{AsyncWriteExt as _, FutureExt as _, StreamExt as _, select};
 use gloo_net::websocket;
 use gloo_net::websocket::futures::WebSocket;
@@ -330,7 +333,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         let use_display_control = self.0.borrow().use_display_control;
         let use_direct_tls = self.0.borrow().use_direct_tls;
 
-        let (connection_result, ws) = connect(ConnectParams {
+        let (connection_result, rdp_reader, rdp_writer) = connect(ConnectParams {
             ws,
             config,
             proxy_auth_token: auth_token,
@@ -344,8 +347,6 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         .await?;
 
         info!("Connected!");
-
-        let (rdp_reader, rdp_writer) = futures_util::AsyncReadExt::split(ws);
 
         let (writer_tx, writer_rx) = mpsc::unbounded();
 
@@ -408,7 +409,7 @@ pub(crate) struct Session {
     // Consumed when `run` is called
     input_events_rx: RefCell<Option<mpsc::UnboundedReceiver<RdpInputEvent>>>,
     connection_result: RefCell<Option<connector::ConnectionResult>>,
-    rdp_reader: RefCell<Option<ReadHalf<WebSocket>>>,
+    rdp_reader: RefCell<Option<BoxedReader>>,
     clipboard: RefCell<Option<Option<WasmClipboard>>>,
 }
 
@@ -935,14 +936,14 @@ fn build_config(
 
 async fn writer_task(
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    rdp_writer: WriteHalf<WebSocket>,
+    rdp_writer: BoxedWriter,
     outbound_limit: Option<usize>,
 ) {
     debug!("writer task started");
 
     async fn inner(
         mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
-        mut rdp_writer: WriteHalf<WebSocket>,
+        mut rdp_writer: BoxedWriter,
         outbound_limit: Option<usize>,
     ) -> anyhow::Result<()> {
         while let Some(frame) = rx.next().await {
@@ -995,7 +996,7 @@ async fn connect(
         use_display_control,
         use_direct_tls,
     }: ConnectParams,
-) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
+) -> Result<(connector::ConnectionResult, BoxedReader, BoxedWriter), IronError> {
     let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
 
     // In web browser environments, we do not have an easy access to the local address of the socket.
@@ -1016,14 +1017,7 @@ async fn connect(
     if use_direct_tls {
         // Direct TLS mode: proxy is a blind TCP forwarder.
         // IronRDP does X.224 + TLS + CredSSP end-to-end through the tunnel.
-        let (connection_result, ws) = connect_direct(
-            framed,
-            connector,
-            destination,
-            kdc_proxy_url,
-        )
-        .await?;
-        return Ok((connection_result, ws));
+        return connect_direct(framed, connector, destination, proxy_auth_token, kdc_proxy_url).await;
     }
 
     let (upgraded, server_public_key) =
@@ -1048,22 +1042,62 @@ async fn connect(
     .await?;
 
     let ws = framed.into_inner_no_leftover();
+    let (rdp_reader, rdp_writer) = futures_util::AsyncReadExt::split(ws);
 
-    Ok((connection_result, ws))
+    Ok((connection_result, Box::new(rdp_reader), Box::new(rdp_writer)))
 }
 
 /// Direct TLS connection mode: the proxy is a blind TCP forwarder.
 /// IronRDP does X.224 negotiation, TLS upgrade, and CredSSP/NLA end-to-end
 /// through the WebSocket tunnel, with the proxy never seeing plaintext.
 async fn connect_direct(
-    mut framed: ironrdp_futures::LocalFuturesFramed<WebSocket>,
+    framed: ironrdp_futures::LocalFuturesFramed<WebSocket>,
     mut connector: ClientConnector,
     destination: String,
+    auth_token: String,
     kdc_proxy_url: Option<String>,
-) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
+) -> Result<(connector::ConnectionResult, BoxedReader, BoxedWriter), IronError> {
     use ironrdp::connector::credssp::KerberosConfig;
 
     info!("Begin direct TLS connection procedure");
+
+    // Step 0: Send routing header and wait for OK.
+    // The proxy expects a JSON text message before it opens the TCP connection.
+    let mut ws = framed.into_inner_no_leftover();
+
+    {
+        use futures_util::SinkExt as _;
+        use gloo_net::websocket::Message as WsMsg;
+
+        let routing = format!(
+            r#"{{"destination":"{}","authToken":"{}"}}"#,
+            destination, auth_token
+        );
+        ws.send(WsMsg::Text(routing)).await
+            .map_err(|e| IronError::from(anyhow::anyhow!("Failed to send routing header: {e}")))?;
+    }
+
+    // Wait for proxy to confirm TCP connection
+    {
+        use futures_util::StreamExt as _;
+        use gloo_net::websocket::Message as WsMsg;
+
+        match ws.next().await {
+            Some(Ok(WsMsg::Text(text))) => {
+                if text.contains("error") {
+                    return Err(IronError::from(anyhow::anyhow!("Proxy routing failed: {text}")));
+                }
+                info!("Proxy TCP connection established: {text}");
+            }
+            other => {
+                return Err(IronError::from(anyhow::anyhow!(
+                    "Expected routing response, got: {other:?}"
+                )));
+            }
+        }
+    }
+
+    let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
 
     // Step 1: X.224 negotiation (travels through the blind proxy to the RDP server)
     let should_upgrade = ironrdp_futures::connect_begin(&mut framed, &mut connector).await?;
@@ -1099,18 +1133,10 @@ async fn connect_direct(
     )
     .await?;
 
-    // Extract the TLS stream — the caller needs the underlying WebSocket back
-    // for the session reader/writer split. Since TLS is now in the path,
-    // we return a dummy that signals we can't unwrap back to raw WS.
-    // TODO: The session loop needs to work with the TLS stream directly.
-    let _tls_stream = tls_framed.into_inner_no_leftover();
+    let tls_stream = tls_framed.into_inner_no_leftover();
+    let (rdp_reader, rdp_writer) = futures_util::AsyncReadExt::split(tls_stream);
 
-    // For now, we need to return a WebSocket for the session loop.
-    // This is a temporary limitation — the session loop should be refactored
-    // to work with any AsyncRead+AsyncWrite, not just WebSocket.
-    Err(IronError::from(anyhow::anyhow!(
-        "Direct TLS mode: session established but post-connect session loop not yet wired for TLS stream"
-    )))
+    Ok((connection_result, Box::new(rdp_reader), Box::new(rdp_writer)))
 }
 
 async fn connect_rdcleanpath<S>(
