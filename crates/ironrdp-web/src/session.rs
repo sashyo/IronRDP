@@ -10,8 +10,8 @@ use base64::Engine as _;
 use futures_channel::mpsc;
 use futures_util::io::{ReadHalf, WriteHalf};
 
-type BoxedReader = Box<dyn futures_io::AsyncRead + Unpin>;
-type BoxedWriter = Box<dyn futures_io::AsyncWrite + Unpin>;
+type BoxedReader = Box<dyn futures_util::AsyncRead + Unpin>;
+type BoxedWriter = Box<dyn futures_util::AsyncWrite + Unpin>;
 use futures_util::{AsyncWriteExt as _, FutureExt as _, StreamExt as _, select};
 use gloo_net::websocket;
 use gloo_net::websocket::futures::WebSocket;
