@@ -70,6 +70,8 @@ struct SessionBuilderInner {
     use_display_control: bool,
     enable_credssp: bool,
     outbound_message_size_limit: Option<usize>,
+    /// When true, use direct TLS connection (trustless proxy mode) instead of RDCleanPath.
+    use_direct_tls: bool,
 }
 
 impl Default for SessionBuilderInner {
@@ -98,6 +100,7 @@ impl Default for SessionBuilderInner {
             use_display_control: false,
             enable_credssp: true,
             outbound_message_size_limit: None,
+            use_direct_tls: false,
         }
     }
 }
@@ -214,6 +217,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |kdc_proxy_url: String| { self.0.borrow_mut().kdc_proxy_url = Some(kdc_proxy_url) };
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
+            |direct_tls: bool| { self.0.borrow_mut().use_direct_tls = direct_tls };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -324,6 +328,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         }
 
         let use_display_control = self.0.borrow().use_display_control;
+        let use_direct_tls = self.0.borrow().use_direct_tls;
 
         let (connection_result, ws) = connect(ConnectParams {
             ws,
@@ -334,6 +339,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             kdc_proxy_url,
             clipboard_backend: clipboard.as_ref().map(|clip| clip.backend()),
             use_display_control,
+            use_direct_tls,
         })
         .await?;
 
@@ -974,6 +980,7 @@ struct ConnectParams {
     kdc_proxy_url: Option<String>,
     clipboard_backend: Option<WasmClipboardBackend>,
     use_display_control: bool,
+    use_direct_tls: bool,
 }
 
 async fn connect(
@@ -986,6 +993,7 @@ async fn connect(
         kdc_proxy_url,
         clipboard_backend,
         use_display_control,
+        use_direct_tls,
     }: ConnectParams,
 ) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
     let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
@@ -1003,6 +1011,19 @@ async fn connect(
         connector.attach_static_channel(
             DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new()))),
         );
+    }
+
+    if use_direct_tls {
+        // Direct TLS mode: proxy is a blind TCP forwarder.
+        // IronRDP does X.224 + TLS + CredSSP end-to-end through the tunnel.
+        let (connection_result, ws) = connect_direct(
+            framed,
+            connector,
+            destination,
+            kdc_proxy_url,
+        )
+        .await?;
+        return Ok((connection_result, ws));
     }
 
     let (upgraded, server_public_key) =
@@ -1029,6 +1050,67 @@ async fn connect(
     let ws = framed.into_inner_no_leftover();
 
     Ok((connection_result, ws))
+}
+
+/// Direct TLS connection mode: the proxy is a blind TCP forwarder.
+/// IronRDP does X.224 negotiation, TLS upgrade, and CredSSP/NLA end-to-end
+/// through the WebSocket tunnel, with the proxy never seeing plaintext.
+async fn connect_direct(
+    mut framed: ironrdp_futures::LocalFuturesFramed<WebSocket>,
+    mut connector: ClientConnector,
+    destination: String,
+    kdc_proxy_url: Option<String>,
+) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
+    use ironrdp::connector::credssp::KerberosConfig;
+
+    info!("Begin direct TLS connection procedure");
+
+    // Step 1: X.224 negotiation (travels through the blind proxy to the RDP server)
+    let should_upgrade = ironrdp_futures::connect_begin(&mut framed, &mut connector).await?;
+
+    // Step 2: TLS upgrade — the handshake goes end-to-end through the tunnel
+    let (ws, leftover) = framed.into_inner();
+    let (tls_stream, tls_cert) = ironrdp_tls_wasm::upgrade(ws, &destination)
+        .await
+        .map_err(|e| IronError::from(anyhow::anyhow!("TLS upgrade failed: {e}")))?;
+
+    let server_public_key = ironrdp_tls_wasm::extract_tls_server_public_key(&tls_cert)
+        .context("unable to extract TLS server public key")?
+        .to_owned();
+
+    let upgraded = ironrdp_futures::mark_as_upgraded(should_upgrade, &mut connector);
+
+    // Step 3: Wrap the TLS stream back into a Framed for connect_finalize
+    let mut tls_framed = ironrdp_futures::LocalFuturesFramed::new_with_leftover(tls_stream, leftover);
+
+    let connection_result = ironrdp_futures::connect_finalize(
+        upgraded,
+        connector,
+        &mut tls_framed,
+        &mut WasmNetworkClient,
+        (&destination).into(),
+        server_public_key,
+        url::Url::parse(kdc_proxy_url.unwrap_or_default().as_str())
+            .ok()
+            .map(|url| KerberosConfig {
+                kdc_proxy_url: Some(url),
+                hostname: Some(destination),
+            }),
+    )
+    .await?;
+
+    // Extract the TLS stream — the caller needs the underlying WebSocket back
+    // for the session reader/writer split. Since TLS is now in the path,
+    // we return a dummy that signals we can't unwrap back to raw WS.
+    // TODO: The session loop needs to work with the TLS stream directly.
+    let _tls_stream = tls_framed.into_inner_no_leftover();
+
+    // For now, we need to return a WebSocket for the session loop.
+    // This is a temporary limitation — the session loop should be refactored
+    // to work with any AsyncRead+AsyncWrite, not just WebSocket.
+    Err(IronError::from(anyhow::anyhow!(
+        "Direct TLS mode: session established but post-connect session loop not yet wired for TLS stream"
+    )))
 }
 
 async fn connect_rdcleanpath<S>(
