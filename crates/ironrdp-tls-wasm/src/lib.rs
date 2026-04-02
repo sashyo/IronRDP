@@ -25,8 +25,8 @@ pub struct TlsStream<S> {
     inner: S,
     /// Outgoing TLS ciphertext that hasn't been flushed to the wire yet.
     write_buf: Vec<u8>,
-    /// Incoming ciphertext that hasn't been fed to rustls yet.
-    read_buf: Vec<u8>,
+    /// Incoming ciphertext from the wire not yet consumed by rustls.
+    incoming: Vec<u8>,
 }
 
 impl<S> TlsStream<S> {
@@ -34,15 +34,36 @@ impl<S> TlsStream<S> {
     pub fn tls_connection(&self) -> &ClientConnection {
         &self.tls
     }
+
+    /// Feed as much of `self.incoming` to rustls as it will accept,
+    /// then process the new packets. Returns Ok(()) on success.
+    fn feed_incoming(&mut self) -> io::Result<()> {
+        while !self.incoming.is_empty() {
+            let used = self.tls.read_tls(&mut self.incoming.as_slice())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            if used == 0 {
+                break;
+            }
+            self.incoming.drain(..used);
+
+            let state = self.tls.process_new_packets()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+            // If rustls needs to send data (alerts, etc), buffer it
+            if self.tls.wants_write() {
+                let _ = self.tls.write_tls(&mut self.write_buf);
+            }
+
+            // If plaintext is available, stop feeding and let caller drain first.
+            if state.plaintext_bytes_to_read() > 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Perform a TLS upgrade on the given stream.
-///
-/// This is the WASM-compatible equivalent of `ironrdp_tls::upgrade`.
-/// The stream `S` can be any ordered, reliable byte channel — typically a
-/// WebRTC DataChannel wrapped as `AsyncRead + AsyncWrite`.
-///
-/// Returns the TLS-wrapped stream and the server's x509 certificate.
 pub async fn upgrade<S>(mut stream: S, server_name: &str) -> io::Result<(TlsStream<S>, x509_cert::Certificate)>
 where
     S: Unpin + AsyncRead + AsyncWrite,
@@ -53,13 +74,12 @@ where
         .with_no_client_auth();
 
     // Disable TLS resumption — CredSSP does not support it.
-    // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-cssp/385a7489-d46b-464c-b224-f7340e308a5c
     config.resumption = rustls::client::Resumption::disabled();
 
     let domain = ServerName::try_from(server_name.to_owned()).map_err(io::Error::other)?;
     let mut tls = ClientConnection::new(Arc::new(config), domain).map_err(io::Error::other)?;
 
-    // Drive the TLS handshake to completion over the async stream.
+    // Drive the TLS handshake to completion.
     handshake(&mut tls, &mut stream).await?;
 
     // Extract server certificate.
@@ -68,11 +88,18 @@ where
             .peer_certificates()
             .and_then(|certs| certs.first())
             .ok_or_else(|| io::Error::other("peer certificate is missing"))?;
-
         x509_cert::Certificate::from_der(cert).map_err(io::Error::other)?
     };
 
-    Ok((TlsStream { tls, inner: stream, write_buf: Vec::new(), read_buf: Vec::new() }, tls_cert))
+    Ok((
+        TlsStream {
+            tls,
+            inner: stream,
+            write_buf: Vec::new(),
+            incoming: Vec::new(),
+        },
+        tls_cert,
+    ))
 }
 
 /// Drive the rustls handshake to completion over an async stream.
@@ -80,46 +107,39 @@ async fn handshake<S>(tls: &mut ClientConnection, stream: &mut S) -> io::Result<
 where
     S: Unpin + AsyncRead + AsyncWrite,
 {
-    let mut read_buf = vec![0u8; 16384];
+    let mut buf = vec![0u8; 16384];
 
     while tls.is_handshaking() {
-        // Write any pending TLS records to the wire.
+        // Flush outgoing TLS data.
         while tls.wants_write() {
-            let mut outgoing = Vec::new();
-            tls.write_tls(&mut outgoing)?;
-            if !outgoing.is_empty() {
-                stream.write_all(&outgoing).await?;
+            let mut out = Vec::new();
+            tls.write_tls(&mut out)?;
+            if !out.is_empty() {
+                stream.write_all(&out).await?;
                 stream.flush().await?;
             }
         }
 
-        // If TLS wants to read, pull bytes from the wire.
+        // Read incoming TLS data.
         if tls.wants_read() {
-            let n = stream.read(&mut read_buf).await?;
+            let n = stream.read(&mut buf).await?;
             if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "stream closed during TLS handshake",
-                ));
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed during handshake"));
             }
-            // Feed all received bytes to rustls — may need multiple read_tls calls
-            let mut consumed = 0;
-            while consumed < n {
-                let used = tls.read_tls(&mut &read_buf[consumed..n])?;
-                if used == 0 {
-                    break;
-                }
-                consumed += used;
+            let mut off = 0;
+            while off < n {
+                let used = tls.read_tls(&mut &buf[off..n])?;
+                if used == 0 { break; }
+                off += used;
             }
             tls.process_new_packets()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         }
     }
-
     Ok(())
 }
 
-// ── AsyncRead / AsyncWrite for TlsStream ─────────────────────────
+// ── AsyncRead for TlsStream ──────────────────────────────────────
 
 impl<S> AsyncRead for TlsStream<S>
 where
@@ -128,7 +148,7 @@ where
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
-        // First, try to read already-decrypted data from rustls.
+        // 1. Try reading already-decrypted plaintext.
         match this.tls.reader().read(buf) {
             Ok(n) if n > 0 => return Poll::Ready(Ok(n)),
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -136,19 +156,9 @@ where
             _ => {}
         }
 
-        // Feed any buffered ciphertext to rustls first
-        if !this.read_buf.is_empty() {
-            let used = this.tls.read_tls(&mut this.read_buf.as_slice())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            this.read_buf.drain(..used);
-
-            this.tls.process_new_packets()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-            if this.tls.wants_write() {
-                let _ = this.tls.write_tls(&mut this.write_buf);
-            }
-
+        // 2. Feed any buffered incoming ciphertext.
+        if !this.incoming.is_empty() {
+            this.feed_incoming()?;
             match this.tls.reader().read(buf) {
                 Ok(n) if n > 0 => return Poll::Ready(Ok(n)),
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -157,26 +167,15 @@ where
             }
         }
 
-        // Need more ciphertext from the wire.
+        // 3. Read more ciphertext from the wire.
         let mut tmp = [0u8; 16384];
         match Pin::new(&mut this.inner).poll_read(cx, &mut tmp) {
             Poll::Ready(Ok(0)) => Poll::Ready(Ok(0)),
             Poll::Ready(Ok(n)) => {
-                // Feed to rustls
-                let used = this.tls.read_tls(&mut &tmp[..n])
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-                // Buffer any unconsumed bytes for next call
-                if used < n {
-                    this.read_buf.extend_from_slice(&tmp[used..n]);
-                }
-
-                this.tls.process_new_packets()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-                if this.tls.wants_write() {
-                    let _ = this.tls.write_tls(&mut this.write_buf);
-                }
+                // Append all received bytes to the incoming buffer.
+                this.incoming.extend_from_slice(&tmp[..n]);
+                // Feed what we can to rustls.
+                this.feed_incoming()?;
 
                 match this.tls.reader().read(buf) {
                     Ok(n) if n > 0 => Poll::Ready(Ok(n)),
@@ -186,7 +185,10 @@ where
                     }
                     Err(e) => Poll::Ready(Err(e)),
                     _ => {
-                        cx.waker().wake_by_ref();
+                        // No plaintext yet but we have buffered ciphertext — wake to retry.
+                        if !this.incoming.is_empty() {
+                            cx.waker().wake_by_ref();
+                        }
                         Poll::Pending
                     }
                 }
@@ -197,6 +199,8 @@ where
     }
 }
 
+// ── AsyncWrite for TlsStream ─────────────────────────────────────
+
 impl<S> AsyncWrite for TlsStream<S>
 where
     S: Unpin + AsyncRead + AsyncWrite,
@@ -204,12 +208,10 @@ where
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
-        // First, flush any buffered outgoing TLS data
+        // Flush buffered outgoing data first.
         while !this.write_buf.is_empty() {
             match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf) {
-                Poll::Ready(Ok(n)) => {
-                    this.write_buf.drain(..n);
-                }
+                Poll::Ready(Ok(n)) => { this.write_buf.drain(..n); }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -218,19 +220,16 @@ where
         // Write plaintext into rustls.
         let n = this.tls.writer().write(buf)?;
 
-        // Collect TLS ciphertext into buffer
-        this.tls
-            .write_tls(&mut this.write_buf)
+        // Collect ciphertext.
+        this.tls.write_tls(&mut this.write_buf)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        // Try to write as much as possible
+        // Flush as much as possible.
         while !this.write_buf.is_empty() {
             match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf) {
-                Poll::Ready(Ok(written)) => {
-                    this.write_buf.drain(..written);
-                }
+                Poll::Ready(Ok(written)) => { this.write_buf.drain(..written); }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => break, // will flush on next poll_write or poll_flush
+                Poll::Pending => break,
             }
         }
 
@@ -240,17 +239,12 @@ where
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        // Collect any remaining TLS output
-        this.tls
-            .write_tls(&mut this.write_buf)
+        this.tls.write_tls(&mut this.write_buf)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        // Flush all buffered data
         while !this.write_buf.is_empty() {
             match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf) {
-                Poll::Ready(Ok(n)) => {
-                    this.write_buf.drain(..n);
-                }
+                Poll::Ready(Ok(n)) => { this.write_buf.drain(..n); }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -266,9 +260,7 @@ where
         let _ = this.tls.write_tls(&mut this.write_buf);
         while !this.write_buf.is_empty() {
             match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf) {
-                Poll::Ready(Ok(n)) => {
-                    this.write_buf.drain(..n);
-                }
+                Poll::Ready(Ok(n)) => { this.write_buf.drain(..n); }
                 Poll::Ready(Err(_)) | Poll::Pending => break,
             }
         }
