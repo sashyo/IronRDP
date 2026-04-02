@@ -3034,8 +3034,10 @@ version = "0.1.0"
 dependencies = [
  "futures-io",
  "futures-util",
- "getrandom 0.3.4",
+ "getrandom 0.2.16",
+ "ring",
  "rustls",
+ "rustls-pki-types",
  "x509-cert",
 ]
 

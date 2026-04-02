@@ -16,12 +16,14 @@ test = false
 
 [dependencies]
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
+rustls-pki-types = { version = "1", features = ["std", "web"] }
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 futures-io = "0.3"
 futures-util = { version = "0.3", features = ["io"] }
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom = { version = "0.2", features = ["js"] }
 
 [lints]
 workspace = true
