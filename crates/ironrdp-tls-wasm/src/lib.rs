@@ -23,6 +23,8 @@ use x509_cert::der::Decode as _;
 pub struct TlsStream<S> {
     tls: ClientConnection,
     inner: S,
+    /// Outgoing TLS ciphertext that hasn't been flushed to the wire yet.
+    write_buf: Vec<u8>,
 }
 
 impl<S> TlsStream<S> {
@@ -68,7 +70,7 @@ where
         x509_cert::Certificate::from_der(cert).map_err(io::Error::other)?
     };
 
-    Ok((TlsStream { tls, inner: stream }, tls_cert))
+    Ok((TlsStream { tls, inner: stream, write_buf: Vec::new() }, tls_cert))
 }
 
 /// Drive the rustls handshake to completion over an async stream.
@@ -76,7 +78,7 @@ async fn handshake<S>(tls: &mut ClientConnection, stream: &mut S) -> io::Result<
 where
     S: Unpin + AsyncRead + AsyncWrite,
 {
-    let mut read_buf = vec![0u8; 8192];
+    let mut read_buf = vec![0u8; 16384];
 
     while tls.is_handshaking() {
         // Write any pending TLS records to the wire.
@@ -98,7 +100,15 @@ where
                     "stream closed during TLS handshake",
                 ));
             }
-            tls.read_tls(&mut &read_buf[..n])?;
+            // Feed all received bytes to rustls — may need multiple read_tls calls
+            let mut consumed = 0;
+            while consumed < n {
+                let used = tls.read_tls(&mut &read_buf[consumed..n])?;
+                if used == 0 {
+                    break;
+                }
+                consumed += used;
+            }
             tls.process_new_packets()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         }
@@ -125,16 +135,27 @@ where
         }
 
         // Need more ciphertext from the wire.
-        let mut tmp = [0u8; 8192];
+        let mut tmp = [0u8; 16384];
         match Pin::new(&mut this.inner).poll_read(cx, &mut tmp) {
             Poll::Ready(Ok(0)) => Poll::Ready(Ok(0)),
             Poll::Ready(Ok(n)) => {
-                this.tls
-                    .read_tls(&mut &tmp[..n])
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                // Feed all bytes to rustls
+                let mut consumed = 0;
+                while consumed < n {
+                    match this.tls.read_tls(&mut &tmp[consumed..n]) {
+                        Ok(0) => break,
+                        Ok(used) => consumed += used,
+                        Err(e) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                    }
+                }
                 this.tls
                     .process_new_packets()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+                // If rustls needs to send data (e.g., alerts, renegotiation), buffer it
+                if this.tls.wants_write() {
+                    let _ = this.tls.write_tls(&mut this.write_buf);
+                }
 
                 match this.tls.reader().read(buf) {
                     Ok(n) => Poll::Ready(Ok(n)),
@@ -158,23 +179,33 @@ where
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
+        // First, flush any buffered outgoing TLS data
+        while !this.write_buf.is_empty() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf) {
+                Poll::Ready(Ok(n)) => {
+                    this.write_buf.drain(..n);
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
         // Write plaintext into rustls.
         let n = this.tls.writer().write(buf)?;
 
-        // Flush TLS records to the wire.
-        let mut outgoing = Vec::new();
+        // Collect TLS ciphertext into buffer
         this.tls
-            .write_tls(&mut outgoing)
+            .write_tls(&mut this.write_buf)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        if !outgoing.is_empty() {
-            match Pin::new(&mut this.inner).poll_write(cx, &outgoing) {
-                Poll::Ready(Ok(_)) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
+        // Try to write as much as possible
+        while !this.write_buf.is_empty() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf) {
+                Poll::Ready(Ok(written)) => {
+                    this.write_buf.drain(..written);
                 }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => break, // will flush on next poll_write or poll_flush
             }
         }
 
@@ -184,14 +215,17 @@ where
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        let mut outgoing = Vec::new();
+        // Collect any remaining TLS output
         this.tls
-            .write_tls(&mut outgoing)
+            .write_tls(&mut this.write_buf)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        if !outgoing.is_empty() {
-            match Pin::new(&mut this.inner).poll_write(cx, &outgoing) {
-                Poll::Ready(Ok(_)) => {}
+        // Flush all buffered data
+        while !this.write_buf.is_empty() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf) {
+                Poll::Ready(Ok(n)) => {
+                    this.write_buf.drain(..n);
+                }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -204,10 +238,14 @@ where
         let this = self.get_mut();
         this.tls.send_close_notify();
 
-        let mut outgoing = Vec::new();
-        let _ = this.tls.write_tls(&mut outgoing);
-        if !outgoing.is_empty() {
-            let _ = Pin::new(&mut this.inner).poll_write(cx, &outgoing);
+        let _ = this.tls.write_tls(&mut this.write_buf);
+        while !this.write_buf.is_empty() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf) {
+                Poll::Ready(Ok(n)) => {
+                    this.write_buf.drain(..n);
+                }
+                Poll::Ready(Err(_)) | Poll::Pending => break,
+            }
         }
 
         Pin::new(&mut this.inner).poll_close(cx)
