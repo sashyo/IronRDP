@@ -1,0 +1,27 @@
+[package]
+name = "ironrdp-tls-wasm"
+version = "0.1.0"
+description = "WASM-compatible TLS upgrade for IronRDP using rustls over abstract byte channels"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+doctest = false
+test = false
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+futures-io = "0.3"
+futures-util = { version = "0.3", features = ["io"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[lints]
+workspace = true
