@@ -74,7 +74,7 @@ struct SessionBuilderInner {
     enable_credssp: bool,
     outbound_message_size_limit: Option<usize>,
     /// When true, use direct TLS connection (trustless proxy mode) instead of RDCleanPath.
-    use_direct_tls: bool,
+    use_e2e_tls: bool,
 }
 
 impl Default for SessionBuilderInner {
@@ -103,7 +103,7 @@ impl Default for SessionBuilderInner {
             use_display_control: false,
             enable_credssp: true,
             outbound_message_size_limit: None,
-            use_direct_tls: false,
+            use_e2e_tls: false,
         }
     }
 }
@@ -220,7 +220,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |kdc_proxy_url: String| { self.0.borrow_mut().kdc_proxy_url = Some(kdc_proxy_url) };
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
-            |direct_tls: bool| { self.0.borrow_mut().use_direct_tls = direct_tls };
+            |e2e_tls: bool| { self.0.borrow_mut().use_e2e_tls = e2e_tls };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -331,7 +331,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         }
 
         let use_display_control = self.0.borrow().use_display_control;
-        let use_direct_tls = self.0.borrow().use_direct_tls;
+        let use_e2e_tls = self.0.borrow().use_e2e_tls;
 
         let (connection_result, rdp_reader, rdp_writer) = connect(ConnectParams {
             ws,
@@ -342,7 +342,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             kdc_proxy_url,
             clipboard_backend: clipboard.as_ref().map(|clip| clip.backend()),
             use_display_control,
-            use_direct_tls,
+            use_e2e_tls,
         })
         .await?;
 
@@ -981,7 +981,7 @@ struct ConnectParams {
     kdc_proxy_url: Option<String>,
     clipboard_backend: Option<WasmClipboardBackend>,
     use_display_control: bool,
-    use_direct_tls: bool,
+    use_e2e_tls: bool,
 }
 
 async fn connect(
@@ -994,7 +994,7 @@ async fn connect(
         kdc_proxy_url,
         clipboard_backend,
         use_display_control,
-        use_direct_tls,
+        use_e2e_tls,
     }: ConnectParams,
 ) -> Result<(connector::ConnectionResult, BoxedReader, BoxedWriter), IronError> {
     let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
@@ -1014,7 +1014,7 @@ async fn connect(
         );
     }
 
-    if use_direct_tls {
+    if use_e2e_tls {
         // Direct TLS mode: proxy is a blind TCP forwarder.
         // IronRDP does X.224 + TLS + CredSSP end-to-end through the tunnel.
         return connect_direct(framed, connector, destination, proxy_auth_token, kdc_proxy_url).await;
