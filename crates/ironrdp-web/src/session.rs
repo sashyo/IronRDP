@@ -1113,7 +1113,10 @@ async fn connect_direct(
 
     // Step 2: TLS upgrade — the handshake goes end-to-end through the tunnel
     let (ws, leftover) = framed.into_inner();
-    let (tls_stream, tls_cert) = ironrdp_tls_wasm::upgrade(ws, &destination)
+    // Use "localhost" as the TLS server name — cert verification is disabled anyway
+    // (RDP servers use self-signed certs). The destination name (e.g. "Sasha'sPc")
+    // is not a valid DNS name and would be rejected by rustls.
+    let (tls_stream, tls_cert) = ironrdp_tls_wasm::upgrade(ws, "localhost")
         .await
         .map_err(|e| IronError::from(anyhow::anyhow!("TLS upgrade failed: {e}")))?;
 
